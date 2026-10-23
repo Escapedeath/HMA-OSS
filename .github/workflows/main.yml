@@ -1,132 +1,126 @@
-name: Main
+name: Build HMA-OSS 173
 
 on:
-  push:
-    branches: [ master ]
-    paths-ignore:
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/workflows/issue.yml'
-      - '.github/workflows/pull_request.yml'
-      - 'fastlane/**'
-      - '**.md'
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ ubuntu-latest ]
-    if: ${{ !startsWith(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      CI: "true"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Checkout oss-173 source
+        uses: actions/checkout@v6
         with:
-          submodules: 'recursive'
+          repository: frknkrc44/HMA-OSS
+          ref: oss-173
+          submodules: recursive
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Gradle wrapper validation
-        uses: gradle/actions/wrapper-validation@v6
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v6
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
-      - name: Write key
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+      - name: Fix version calculation for historical tag
+        shell: bash
         run: |
-          echo officialBuild=true >> local.properties
-          echo storePassword='${{ secrets.KEY_STORE_PASSWORD }}' >> local.properties
-          echo keyAlias='${{ secrets.ALIAS }}' >> local.properties
-          echo keyPassword='${{ secrets.ALIAS_KEY_PASSWORD }}' >> local.properties
-          echo fileDir=`pwd`/key.jks >> local.properties
-          echo crowdinProjectId='${{ secrets.CROWDIN_PROJECT_ID }}' >> local.properties
-          echo crowdinApiKey='${{ secrets.CROWDIN_LIST_MEMBERS_API_TOKEN }}' >> local.properties
-          echo "${{ secrets.KEY_STORE }}" | base64 --decode > key.jks
+          # The project calculates its version from origin/master.
+          # Point this local reference at the selected tag.
+          git update-ref refs/remotes/origin/master "$(git rev-parse HEAD)"
+          git log -1 --format='%H %s'
 
-      - name: Cache gradle
-        uses: actions/cache@v6
+          COUNT=$(git rev-list refs/remotes/origin/master --count)
+          VERSION=$((COUNT - 432))
+          echo "Source version: oss-$VERSION"
+
+          if [ "$VERSION" -ne 173 ]; then
+            echo "::error::Expected oss-173, got oss-$VERSION"
+            exit 1
+          fi
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools platforms;android-37
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle') }}
-          restore-keys: ${{ runner.os }}-gradle-
+          key: ${{ runner.os }}-hma173-gradle-${{ hashFiles('**/*.gradle.kts', '**/libs.versions.toml', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-hma173-gradle-
 
-      - name: Gradle prebuild
+      - name: Configure build
+        shell: bash
         run: |
-          ./gradlew prebuild
+          chmod +x gradlew
 
-      - name: Build APK
+          # Keep the oss-173 version name.
+          # Signing uses the project's fallback debug key.
+          cat > local.properties <<EOF
+          sdk.dir=$ANDROID_HOME
+          officialBuild=true
+          EOF
+
+      - name: Prepare build
+        run: ./gradlew prebuild --no-daemon --stacktrace
+
+      - name: Build manager APKs
+        run: ./gradlew :app:assemble --no-daemon --stacktrace
+
+      - name: Build Zygisk modules
+        run: ./gradlew :zygote:assemble --no-daemon --stacktrace
+
+      - name: Collect module files
+        shell: bash
         run: |
-          ./gradlew :app:assemble
+          mkdir -p artifacts/release artifacts/debug artifacts/manager
 
-      - name: Upload APK mappings
-        uses: actions/upload-artifact@v7
+          cp zygote/build/outputs/magisk/release/*.zip artifacts/release/
+          cp zygote/build/outputs/magisk/debug/*.zip artifacts/debug/
+          cp app/build/outputs/apk/release/*.apk artifacts/manager/
+          cp app/build/outputs/apk/debug/*.apk artifacts/manager/
+
+          find artifacts -type f -exec sha256sum {} \;
+
+      - name: Upload release module
+        uses: actions/upload-artifact@v4
         with:
-          name: app-mappings
-          path: "app/build/outputs/mapping/release"
+          name: HMA-OSS-173-release
+          path: artifacts/release/*.zip
+          if-no-files-found: error
 
-      - name: Build module
-        id: buildModule
-        run: |
-          ./gradlew :zygote:assemble
-          echo "releaseName=$(ls zygote/build/outputs/magisk/release/*.zip | awk -F '(/|.zip)' '{print $6}')" >> $GITHUB_OUTPUT
-          echo "debugName=$(ls zygote/build/outputs/magisk/debug/*.zip | awk -F '(/|.zip)' '{print $6}')" >> $GITHUB_OUTPUT
-          echo "releaseFile=$(ls zygote/build/outputs/magisk/release/*.zip)" >> $GITHUB_OUTPUT
-          echo "debugFile=$(ls zygote/build/outputs/magisk/debug/*.zip)" >> $GITHUB_OUTPUT
-          echo "ossNum=$(ls app/build/outputs/apk/debug/*.apk | awk -F '(/|.apk)' '{print $6}' | cut -f4 -d'-')" >> $GITHUB_OUTPUT
-
-      - name: Upload release
-        uses: actions/upload-artifact@v7
+      - name: Upload debug module
+        uses: actions/upload-artifact@v4
         with:
-          archive: false
-          name: ${{ steps.buildModule.outputs.releaseName }}
-          path: ${{ steps.buildModule.outputs.releaseFile }}
+          name: HMA-OSS-173-debug
+          path: artifacts/debug/*.zip
+          if-no-files-found: error
 
-      - name: Upload module mappings
-        uses: actions/upload-artifact@v7
+      - name: Upload manager APKs
+        uses: actions/upload-artifact@v4
         with:
-          name: zygote-mappings
-          path: "zygote/build/outputs/mapping/release"
+          name: HMA-OSS-173-manager
+          path: artifacts/manager/*.apk
+          if-no-files-found: error
 
-      - name: Upload debug
-        uses: actions/upload-artifact@v7
+      - name: Upload obfuscation mappings
+        uses: actions/upload-artifact@v4
         with:
-          archive: false
-          name: ${{ steps.buildModule.outputs.debugName }}
-          path: ${{ steps.buildModule.outputs.debugFile }}
-
-      - name: Upload to GitHub release
-        uses: softprops/action-gh-release@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          name: oss-${{ steps.buildModule.outputs.ossNum }}
-          body: ${{ github.event.head_commit.message }}
-          files: |
-            ${{ steps.buildModule.outputs.releaseFile }}
-            ${{ steps.buildModule.outputs.debugFile }}
-            app/src/main/assets/translators.json
-          tag_name: oss-${{ steps.buildModule.outputs.ossNum }}
-
-      - name: Post to channel
-        if: ${{ github.event_name != 'pull_request' && success() && github.ref == 'refs/heads/master' }}
-        env:
-          CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL }}
-          BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          COMMIT_URL: ${{ github.event.head_commit.url }}
-          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-        run: |
-          export release=${{ steps.buildModule.outputs.releaseFile }}
-          export debug=${{ steps.buildModule.outputs.debugFile }}
-          ESCAPED=`python3 -c 'import json,os,urllib.parse; msg = json.dumps(os.environ["COMMIT_MESSAGE"]); print(urllib.parse.quote(msg if len(msg) <= 1024 else json.dumps(os.environ["COMMIT_URL"])))'`
-          curl -v "https://api.telegram.org/bot${BOT_TOKEN}/sendMediaGroup?chat_id=${CHANNEL_ID}&media=%5B%7B%22type%22:%22document%22,%20%22media%22:%22attach://release%22%7D,%7B%22type%22:%22document%22,%20%22media%22:%22attach://debug%22,%22caption%22:${ESCAPED}%7D%5D"  -F release="@$release" -F debug="@$debug"
+          name: HMA-OSS-173-mappings
+          path: |
+            app/build/outputs/mapping/release/
+            zygote/build/outputs/mapping/release/
+          if-no-files-found: warn
